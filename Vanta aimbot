@@ -1,0 +1,604 @@
+--[[
+    VANTA Aimbot — Roblox
+    Executors : Xeno · Delta · Solara (mobile + desktop builds)
+    Platforms : PC (keyboard + mouse) | Mobile (touch)
+    Toggle    : Q key (PC) | on-screen button (mobile)
+]]
+
+-- ── Platform detection ────────────────────────────────────────────────────────
+local UIS        = game:GetService("UserInputService")
+local IS_MOBILE  = UIS.TouchEnabled and not UIS.KeyboardEnabled
+
+-- ── Executor compatibility ────────────────────────────────────────────────────
+-- Priority: syn.protect_gui → gethui() → CoreGui
+local function get_safe_parent()
+    if syn and syn.protect_gui then
+        -- Synapse X style (some builds of Solara inherit this)
+        local sg = Instance.new("ScreenGui")
+        pcall(syn.protect_gui, sg)
+        sg.Parent = game:GetService("CoreGui")
+        return sg
+    elseif gethui then
+        -- Xeno, Delta, Solara standard
+        return gethui()
+    else
+        -- bare fallback
+        return game:GetService("CoreGui")
+    end
+end
+
+-- Drawing API check — fallback to ScreenGui circle if missing
+local HAS_DRAWING = (typeof(Drawing) ~= "nil")
+
+-- ── Config ────────────────────────────────────────────────────────────────────
+local cfg = {
+    enabled      = false,
+    fov          = 120,
+    smoothing    = 0.25,
+    target_part  = "Head",
+    team_check   = true,
+    visible_only = false,
+    show_fov     = true,
+    -- PC: hold RMB | Mobile: always aim when enabled (no RMB exists)
+    hold_to_aim  = not IS_MOBILE,
+}
+
+-- ── Services ──────────────────────────────────────────────────────────────────
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenSvc   = game:GetService("TweenService")
+
+local lp         = Players.LocalPlayer
+local cam        = workspace.CurrentCamera
+
+-- ── FOV visual ────────────────────────────────────────────────────────────────
+-- Drawing API path (Xeno / Delta / Solara all support this)
+local fov_circle, fov_frame
+
+if HAS_DRAWING then
+    fov_circle           = Drawing.new("Circle")
+    fov_circle.Visible   = cfg.show_fov
+    fov_circle.Radius    = cfg.fov
+    fov_circle.Color     = Color3.fromRGB(255, 60, 60)
+    fov_circle.Thickness = 1.5
+    fov_circle.Filled    = false
+    fov_circle.NumSides  = 64
+else
+    -- ScreenGui fallback — square approximation via UICorner
+    local sg_fov = Instance.new("ScreenGui")
+    sg_fov.ResetOnSpawn      = false
+    sg_fov.IgnoreGuiInset    = true
+    sg_fov.ZIndexBehavior    = Enum.ZIndexBehavior.Sibling
+    sg_fov.Parent            = get_safe_parent()
+
+    local d = cfg.fov * 2
+    fov_frame = Instance.new("Frame")
+    fov_frame.Size                  = UDim2.new(0, d, 0, d)
+    fov_frame.AnchorPoint           = Vector2.new(0.5, 0.5)
+    fov_frame.Position              = UDim2.new(0.5, 0, 0.5, 0)
+    fov_frame.BackgroundTransparency = 1
+    fov_frame.BorderSizePixel       = 0
+    fov_frame.Parent                = sg_fov
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color     = Color3.fromRGB(255, 60, 60)
+    stroke.Thickness = 1.5
+    stroke.Parent    = fov_frame
+
+    Instance.new("UICorner", fov_frame).CornerRadius = UDim.new(1, 0)
+end
+
+local function update_fov_visual(visible, radius)
+    if HAS_DRAWING and fov_circle then
+        fov_circle.Visible = visible
+        fov_circle.Radius  = radius
+        local vp = cam.ViewportSize
+        fov_circle.Position = Vector2.new(vp.X / 2, vp.Y / 2)
+    elseif fov_frame then
+        fov_frame.Visible = visible
+        local d = radius * 2
+        fov_frame.Size = UDim2.new(0, d, 0, d)
+    end
+end
+
+-- ── Aimbot helpers ────────────────────────────────────────────────────────────
+local function get_center()
+    return Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+end
+
+local function is_alive(char)
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.Health > 0
+end
+
+local function is_enemy(player)
+    if not cfg.team_check then return true end
+    if not lp.Team or not player.Team then return true end
+    return player.Team ~= lp.Team
+end
+
+local function is_visible(part)
+    if not cfg.visible_only then return true end
+    local origin = cam.CFrame.Position
+    local ray    = Ray.new(origin, part.Position - origin)
+    local hit    = workspace:FindPartOnRayWithIgnoreList(
+        ray, { lp.Character, cam })
+    return hit and hit:IsDescendantOf(part.Parent)
+end
+
+local function get_target()
+    local best, best_dist = nil, cfg.fov
+    local center          = get_center()
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == lp then continue end
+        if not is_enemy(p) then continue end
+
+        local char = p.Character
+        if not is_alive(char) then continue end
+
+        local part = char:FindFirstChild(cfg.target_part)
+        if not part then continue end
+
+        local sp, on_screen = cam:WorldToViewportPoint(part.Position)
+        if not on_screen then continue end
+
+        local dist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+        if dist < best_dist and is_visible(part) then
+            best_dist = dist
+            best      = part
+        end
+    end
+
+    return best
+end
+
+local function aim_at(part)
+    local cf = CFrame.lookAt(cam.CFrame.Position, part.Position)
+    cam.CFrame = cam.CFrame:Lerp(cf, cfg.smoothing)
+end
+
+-- ── Aim trigger logic ─────────────────────────────────────────────────────────
+-- PC : hold RMB (when hold_to_aim = true)
+-- Mobile : auto when enabled (no hold needed)
+local function aim_trigger_active()
+    if not cfg.enabled then return false end
+    if IS_MOBILE then return true end
+    if cfg.hold_to_aim then
+        return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+    end
+    return true
+end
+
+RunService.RenderStepped:Connect(function()
+    update_fov_visual(cfg.show_fov, cfg.fov)
+    if not aim_trigger_active() then return end
+    local t = get_target()
+    if t then aim_at(t) end
+end)
+
+-- ════════════════════════════════════════════════════════════════════════════════
+-- UI
+-- ════════════════════════════════════════════════════════════════════════════════
+local sg = Instance.new("ScreenGui")
+sg.Name                 = "VANTA_UI"
+sg.ResetOnSpawn         = false
+sg.ZIndexBehavior       = Enum.ZIndexBehavior.Sibling
+sg.IgnoreGuiInset       = true
+sg.DisplayOrder         = 999
+
+-- executor-safe parent
+if syn and syn.protect_gui then
+    pcall(syn.protect_gui, sg)
+    sg.Parent = game:GetService("CoreGui")
+elseif gethui then
+    sg.Parent = gethui()
+else
+    sg.Parent = game:GetService("CoreGui")
+end
+
+-- ── Palette ───────────────────────────────────────────────────────────────────
+local C = {
+    bg      = Color3.fromRGB(14,  14,  20),
+    panel   = Color3.fromRGB(22,  22,  32),
+    accent  = Color3.fromRGB(220, 50,  50),
+    accent2 = Color3.fromRGB(140, 25,  25),
+    text    = Color3.fromRGB(230, 230, 230),
+    sub     = Color3.fromRGB(130, 130, 145),
+    on      = Color3.fromRGB(55,  200, 80),
+    off     = Color3.fromRGB(80,  80,  95),
+    slider  = Color3.fromRGB(38,  38,  52),
+}
+
+-- scale UI larger on mobile so it's tappable
+local SCALE = IS_MOBILE and 1.35 or 1.0
+local function px(n) return math.floor(n * SCALE) end
+
+local function make(cls, props, parent)
+    local o = Instance.new(cls)
+    for k, v in pairs(props) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+
+local function corner(r, p)
+    make("UICorner", { CornerRadius = UDim.new(0, r) }, p)
+end
+
+local function tw(obj, props, t)
+    TweenSvc:Create(obj, TweenInfo.new(t or 0.14, Enum.EasingStyle.Quad), props):Play()
+end
+
+-- ── Window ────────────────────────────────────────────────────────────────────
+local WIN_W = px(282)
+local WIN_H = px(390)
+
+local win = make("Frame", {
+    Size             = UDim2.new(0, WIN_W, 0, WIN_H),
+    Position         = IS_MOBILE
+                       and UDim2.new(0, 10, 0, 60)   -- top-left on mobile
+                       or  UDim2.new(0, 60, 0, 60),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel  = 0,
+    ClipsDescendants = true,
+}, sg)
+corner(8, win)
+make("UIStroke", { Color = C.accent, Thickness = 1, Transparency = 0.55 }, win)
+
+-- title bar
+local tbar = make("Frame", {
+    Size             = UDim2.new(1, 0, 0, px(36)),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel  = 0,
+}, win)
+corner(8, tbar)
+make("Frame", {   -- fill bottom rounded gap
+    Size             = UDim2.new(1, 0, 0, 8),
+    Position         = UDim2.new(0, 0, 1, -8),
+    BackgroundColor3 = C.panel,
+    BorderSizePixel  = 0,
+}, tbar)
+
+make("TextLabel", {
+    Size               = UDim2.new(1, -px(44), 1, 0),
+    Position           = UDim2.new(0, px(12), 0, 0),
+    BackgroundTransparency = 1,
+    Text               = "VANTA  ·  Aimbot",
+    TextColor3         = C.accent,
+    TextXAlignment     = Enum.TextXAlignment.Left,
+    Font               = Enum.Font.GothamBold,
+    TextSize           = px(12),
+}, tbar)
+
+-- platform badge
+make("TextLabel", {
+    Size               = UDim2.new(0, px(48), 0, px(16)),
+    Position           = UDim2.new(1, -px(96), 0.5, -px(8)),
+    BackgroundColor3   = IS_MOBILE and Color3.fromRGB(40,80,180) or Color3.fromRGB(40,40,70),
+    BackgroundTransparency = 0,
+    Text               = IS_MOBILE and "📱 MOBILE" or "🖥  PC",
+    TextColor3         = C.text,
+    Font               = Enum.Font.GothamBold,
+    TextSize           = px(9),
+}, tbar):FindFirstAncestor("Frame") -- just create it on tbar directly below
+do
+    local badge = make("TextLabel", {
+        Size               = UDim2.new(0, px(58), 0, px(16)),
+        Position           = UDim2.new(1, -px(88), 0.5, -px(8)),
+        BackgroundColor3   = IS_MOBILE and Color3.fromRGB(30,70,160) or Color3.fromRGB(35,35,60),
+        BackgroundTransparency = 0,
+        Text               = IS_MOBILE and "MOBILE" or "PC",
+        TextColor3         = C.sub,
+        Font               = Enum.Font.GothamBold,
+        TextSize           = px(9),
+        BorderSizePixel    = 0,
+    }, tbar)
+    corner(4, badge)
+end
+
+local close_btn = make("TextButton", {
+    Size             = UDim2.new(0, px(26), 0, px(26)),
+    Position         = UDim2.new(1, -px(30), 0.5, -px(13)),
+    BackgroundColor3 = C.accent2,
+    Text             = "✕",
+    TextColor3       = C.text,
+    Font             = Enum.Font.GothamBold,
+    TextSize         = px(11),
+    BorderSizePixel  = 0,
+}, tbar)
+corner(6, close_btn)
+close_btn.MouseButton1Click:Connect(function() win.Visible = false end)
+
+-- content scroll
+local content = make("ScrollingFrame", {
+    Size                 = UDim2.new(1, 0, 1, -px(40)),
+    Position             = UDim2.new(0, 0, 0, px(40)),
+    BackgroundTransparency = 1,
+    BorderSizePixel      = 0,
+    ScrollBarThickness   = 2,
+    ScrollBarImageColor3 = C.accent,
+    CanvasSize           = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize  = Enum.AutomaticSize.Y,
+}, win)
+make("UIPadding", {
+    PaddingLeft  = UDim.new(0, px(12)),
+    PaddingRight = UDim.new(0, px(12)),
+    PaddingTop   = UDim.new(0, px(8)),
+}, content)
+make("UIListLayout", {
+    Padding       = UDim.new(0, px(7)),
+    FillDirection = Enum.FillDirection.Vertical,
+    SortOrder     = Enum.SortOrder.LayoutOrder,
+}, content)
+
+-- ── Component builders ────────────────────────────────────────────────────────
+local lo = 0
+local function next_order() lo += 1 return lo end
+
+local function sec(label)
+    make("TextLabel", {
+        Size               = UDim2.new(1, 0, 0, px(16)),
+        BackgroundTransparency = 1,
+        Text               = label,
+        TextColor3         = C.sub,
+        TextXAlignment     = Enum.TextXAlignment.Left,
+        Font               = Enum.Font.GothamBold,
+        TextSize           = px(9),
+        LayoutOrder        = next_order(),
+    }, content)
+end
+
+local function toggle(label, default, cb)
+    local row = make("Frame", {
+        Size             = UDim2.new(1, 0, 0, px(34)),
+        BackgroundColor3 = C.panel,
+        BorderSizePixel  = 0,
+        LayoutOrder      = next_order(),
+    }, content)
+    corner(6, row)
+
+    make("TextLabel", {
+        Size               = UDim2.new(1, -px(54), 1, 0),
+        Position           = UDim2.new(0, px(10), 0, 0),
+        BackgroundTransparency = 1,
+        Text               = label,
+        TextColor3         = C.text,
+        TextXAlignment     = Enum.TextXAlignment.Left,
+        Font               = Enum.Font.Gotham,
+        TextSize           = px(11),
+    }, row)
+
+    local pill = make("Frame", {
+        Size             = UDim2.new(0, px(38), 0, px(20)),
+        Position         = UDim2.new(1, -px(48), 0.5, -px(10)),
+        BackgroundColor3 = default and C.on or C.off,
+        BorderSizePixel  = 0,
+    }, row)
+    corner(px(10), pill)
+
+    local knob = make("Frame", {
+        Size             = UDim2.new(0, px(14), 0, px(14)),
+        Position         = default
+                           and UDim2.new(1, -px(17), 0.5, -px(7))
+                           or  UDim2.new(0, px(3),   0.5, -px(7)),
+        BackgroundColor3 = Color3.new(1,1,1),
+        BorderSizePixel  = 0,
+    }, pill)
+    corner(px(7), knob)
+
+    local state = default
+    make("TextButton", {
+        Size               = UDim2.new(1,0,1,0),
+        BackgroundTransparency = 1,
+        Text               = "",
+    }, row).MouseButton1Click:Connect(function()
+        state = not state
+        tw(pill,  { BackgroundColor3 = state and C.on or C.off })
+        tw(knob,  { Position = state
+                    and UDim2.new(1, -px(17), 0.5, -px(7))
+                    or  UDim2.new(0,  px(3),  0.5, -px(7)) })
+        cb(state)
+    end)
+
+    return state, function(v) -- expose setter for external sync
+        state = v
+        pill.BackgroundColor3 = v and C.on or C.off
+        knob.Position = v
+            and UDim2.new(1, -px(17), 0.5, -px(7))
+            or  UDim2.new(0,  px(3),  0.5, -px(7))
+    end
+end
+
+local function slider(label, min_v, max_v, default, fmt, cb)
+    local row = make("Frame", {
+        Size             = UDim2.new(1, 0, 0, px(50)),
+        BackgroundColor3 = C.panel,
+        BorderSizePixel  = 0,
+        LayoutOrder      = next_order(),
+    }, content)
+    corner(6, row)
+
+    local val_lbl = make("TextLabel", {
+        Size               = UDim2.new(1, -px(10), 0, px(20)),
+        Position           = UDim2.new(0, px(10), 0, px(4)),
+        BackgroundTransparency = 1,
+        Text               = label .. ":  " .. string.format(fmt, default),
+        TextColor3         = C.text,
+        TextXAlignment     = Enum.TextXAlignment.Left,
+        Font               = Enum.Font.Gotham,
+        TextSize           = px(11),
+    }, row)
+
+    local track = make("Frame", {
+        Size             = UDim2.new(1, -px(20), 0, px(4)),
+        Position         = UDim2.new(0, px(10), 0, px(34)),
+        BackgroundColor3 = C.slider,
+        BorderSizePixel  = 0,
+    }, row)
+    corner(2, track)
+
+    local pct  = (default - min_v) / (max_v - min_v)
+    local fill = make("Frame", {
+        Size             = UDim2.new(pct, 0, 1, 0),
+        BackgroundColor3 = C.accent,
+        BorderSizePixel  = 0,
+    }, track)
+    corner(2, fill)
+
+    local thumb = make("Frame", {
+        Size             = UDim2.new(0, px(12), 0, px(12)),
+        Position         = UDim2.new(pct, -px(6), 0.5, -px(6)),
+        BackgroundColor3 = Color3.new(1,1,1),
+        BorderSizePixel  = 0,
+    }, track)
+    corner(px(6), thumb)
+
+    local function set_val(x)
+        local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local val = min_v + (max_v - min_v) * rel
+        fill.Size      = UDim2.new(rel, 0, 1, 0)
+        thumb.Position = UDim2.new(rel, -px(6), 0.5, -px(6))
+        val_lbl.Text   = label .. ":  " .. string.format(fmt, val)
+        cb(val)
+    end
+
+    local drag = false
+    make("TextButton", {
+        Size               = UDim2.new(1,0,1,0),
+        BackgroundTransparency = 1,
+        Text               = "",
+    }, track).MouseButton1Down:Connect(function() drag = true end)
+
+    UIS.InputChanged:Connect(function(inp)
+        if drag and inp.UserInputType == Enum.UserInputType.MouseMovement then
+            set_val(inp.Position.X)
+        end
+    end)
+    UIS.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then drag = false end
+    end)
+
+    -- mobile touch
+    track.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then
+            drag = true
+            set_val(inp.Position.X)
+        end
+    end)
+    track.InputChanged:Connect(function(inp)
+        if drag and inp.UserInputType == Enum.UserInputType.Touch then
+            set_val(inp.Position.X)
+        end
+    end)
+    track.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then drag = false end
+    end)
+end
+
+local function dropdown(label, options, default, cb)
+    local row = make("Frame", {
+        Size             = UDim2.new(1, 0, 0, px(34)),
+        BackgroundColor3 = C.panel,
+        BorderSizePixel  = 0,
+        LayoutOrder      = next_order(),
+    }, content)
+    corner(6, row)
+
+    make("TextLabel", {
+        Size               = UDim2.new(0.5, 0, 1, 0),
+        Position           = UDim2.new(0, px(10), 0, 0),
+        BackgroundTransparency = 1,
+        Text               = label,
+        TextColor3         = C.text,
+        TextXAlignment     = Enum.TextXAlignment.Left,
+        Font               = Enum.Font.Gotham,
+        TextSize           = px(11),
+    }, row)
+
+    local sel = default
+    local btn = make("TextButton", {
+        Size             = UDim2.new(0, px(110), 0, px(24)),
+        Position         = UDim2.new(1, -px(118), 0.5, -px(12)),
+        BackgroundColor3 = C.slider,
+        Text             = sel,
+        TextColor3       = C.text,
+        Font             = Enum.Font.Gotham,
+        TextSize         = px(10),
+        BorderSizePixel  = 0,
+    }, row)
+    corner(5, btn)
+
+    btn.MouseButton1Click:Connect(function()
+        local i = table.find(options, sel) or 1
+        sel      = options[(i % #options) + 1]
+        btn.Text = sel
+        cb(sel)
+    end)
+end
+
+-- ── Populate UI ───────────────────────────────────────────────────────────────
+sec("AIMBOT")
+
+local _, set_enabled_toggle = toggle("Aimbot Enabled", cfg.enabled, function(v)
+    cfg.enabled = v
+end)
+
+if not IS_MOBILE then
+    toggle("Hold RMB to Aim", cfg.hold_to_aim, function(v)
+        cfg.hold_to_aim = v
+    end)
+else
+    -- mobile info row
+    make("TextLabel", {
+        Size               = UDim2.new(1, 0, 0, px(26)),
+        BackgroundColor3   = Color3.fromRGB(25,35,60),
+        BackgroundTransparency = 0,
+        Text               = "Auto-aims when enabled  (no hold on touch)",
+        TextColor3         = C.sub,
+        Font               = Enum.Font.Gotham,
+        TextSize           = px(10),
+        LayoutOrder        = next_order(),
+        BorderSizePixel    = 0,
+    }, content)
+end
+
+sec("TARGETING")
+
+dropdown("Target Part", {"Head","HumanoidRootPart"}, cfg.target_part, function(v)
+    cfg.target_part = v
+end)
+
+toggle("Team Check", cfg.team_check, function(v)
+    cfg.team_check = v
+end)
+
+toggle("Visible Only", cfg.visible_only, function(v)
+    cfg.visible_only = v
+end)
+
+sec("PARAMETERS")
+
+slider("FOV",       30,   400,  cfg.fov,       "%.0f", function(v) cfg.fov       = v end)
+slider("Smoothing", 0.02, 1.0,  cfg.smoothing, "%.2f", function(v) cfg.smoothing = v end)
+
+sec("VISUALS")
+
+toggle("Show FOV Circle", cfg.show_fov, function(v)
+    cfg.show_fov = v
+    update_fov_visual(v, cfg.fov)
+end)
+
+-- ── Drag (pointer + touch) ────────────────────────────────────────────────────
+do
+    local dragging, offset = false, Vector2.new()
+
+    local function begin_drag(pos)
+        dragging = true
+        offset   = Vector2.new(
+            pos.X - win.AbsolutePosition.X,
+            pos.Y - win.AbsolutePosition.Y)
+    end
+    local function move_drag(pos)
+        if not dragging then return end
+        win.Position = UDim2.new(0,
